@@ -5,6 +5,8 @@ import os
 import logging
 import copy
 import time
+#  from urllib.parse import urljoin
+from yarl import URL
 from lxml import etree
 
 logging.basicConfig(
@@ -17,7 +19,7 @@ log = logging.getLogger(__name__)
 class Crawler(object):
     def __init__(self, root, *, max_tasks=10, loop=None):
         self._loop = loop or asyncio.get_event_loop()
-        self._root = root
+        self._root = URL(root)
         self._q = asyncio.LifoQueue(loop=self._loop)
         self._max_tasks = max_tasks
         self._session = aiohttp.ClientSession(loop=self._loop)
@@ -27,10 +29,11 @@ class Crawler(object):
         log.info('Start crawling page tasks')
         t0 = time.time()
         self._q.put_nowait((self._root, {}, self.parse_novel))
-        self.tasks = [asyncio.Task(self.worker(), loop=self._loop)
-                      for _ in range(self._max_tasks)]
+        tasks = [asyncio.Task(self.worker(), loop=self._loop)
+                 for _ in range(self._max_tasks)]
         await self._q.join()
-        self.stop()
+        for task in tasks:
+            task.cancel()
         t1 = time.time()
         log.info('Tasks completed,crawled {0:d} pages,\
              using {1:.2f} seconds'.format(self._fetched_url_num, t1-t0))
@@ -51,38 +54,38 @@ class Crawler(object):
     async def crawl(self, url, callback, meta):
         try:
             async with self._session.get(url) as resp:
-                assert callable(callback)
-                await callback(resp, meta)
-                log.debug(f'Crawing {url}')
-                self._fetched_url_num += 1
+                if resp.status == 200:
+                    await callback(resp, meta)
+                    log.debug(f'Crawing {url}')
+                    self._fetched_url_num += 1
         except aiohttp.ClientError:
             log.error(f'Crawling {url} got a error')
 
     async def parse_novel(self, resp, meta):
         html = etree.HTML(await resp.read())
+        base = resp.url
         for tr in html.xpath('//dl[@id="content"]//tr[position()>1]'):
             novel_name = tr.xpath('td[1]/a/text()')[0]
-            url = tr.xpath('td[2]/a/@href')[0]
-            assert isinstance(meta, dict)
-            _meta = copy.copy(meta)
+            url = base.join(URL(tr.xpath('td[2]/a/@href')[0]))
+            _meta = copy.copy(dict(meta))
             _meta.update({'novel_name': novel_name})
             callback = self.parse_chapter
             self._q.put_nowait((url, _meta, callback))
-        links = html.xpath(
-            '//div[@id="pagelink"]/a[@class="next"]/@href'
-        )
-        if links:
-            next_page = links[0]
-            callback = self.parse_novel
-            self._q.put_nowait((next_page, {}, callback))
+        #  links = html.xpath(
+            #  '//div[@id="pagelink"]/a[@class="next"]/@href'
+        #  )
+        #  if links:
+            #  next_page = base.join(URL(links[0]))
+            #  callback = self.parse_novel
+            #  self._q.put_nowait((next_page, {}, callback))
 
     async def parse_chapter(self, resp, meta):
         html = etree.HTML(await resp.read())
+        base = resp.url
         for link in html.xpath('//table[@id="at"]//a'):
             chapter_name = link.text
-            url = link.get('href')
-            assert isinstance(meta, dict)
-            _meta = copy.copy(meta)
+            url = base.join(URL(link.get('href')))
+            _meta = copy.copy(dict(meta))
             _meta.update({'chapter_name': chapter_name})
             callback = self.parse_content
             self._q.put_nowait((url, _meta, callback))
@@ -90,13 +93,13 @@ class Crawler(object):
     async def parse_content(self, resp, meta):
         html = etree.HTML(await resp.read())
         chapter_content = html.xpath('//dd[@id="contents"]//text()')
-        assert isinstance(meta, dict)
+        meta = dict(meta)
         meta.update({'chapter_content': chapter_content})
         callback = self.save_novel
         self._q.put_nowait((None, meta, callback))
 
     async def save_novel(self, meta):
-        assert isinstance(meta, dict)
+        meta = dict(meta)
         novel_name = meta['novel_name']
         chapter_name = meta['chapter_name']
         chapter_content = meta['chapter_content']
@@ -113,10 +116,6 @@ class Crawler(object):
     async def close(self):
         await self._session.close()
 
-    def stop(self):
-        for task in self.tasks:
-            task.cancel()
-
 
 def main():
     root_url = 'http://www.23us.so/full.html'
@@ -128,7 +127,8 @@ def main():
         loop.run_until_complete(c.run())
     except KeyboardInterrupt:
         log.info('Crawler stopped by Ctrl-C')
-        c.stop()
+        for task in asyncio.Task.all_tasks():
+            task.cancel()
     finally:
         loop.run_until_complete(c.close())
         loop.close()
